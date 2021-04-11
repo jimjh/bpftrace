@@ -1,0 +1,71 @@
+#!/usr/local/bin/bpftrace
+/*
+ * Counts the number of DNS lookups over UDP per second.
+ *
+ * Adapted from udplife by Brendan Gregg.
+ *
+ * Unfortunately we can't use ip4_datagram_connect. It is not a reliable method for counting
+ * DNS queries in my tests across multiple DNS clients. Using udp_sendmsg has some cost. To
+ * gain confidence with this tool, run it concurrently with dnsperf or flame and make sure that
+ * it prints the qps you expect.
+ */
+
+#include <net/sock.h>
+#include <net/inet_sock.h>
+#include <linux/socket.h>
+
+BEGIN {
+  printf("%-8s | %20s", "Time", "QPS in Last Second\n");
+  printf("---------------------------------\n");
+}
+
+/*
+ * Not all DNS clients start their requests with connect? dig doesn't seem to.
+ * We must use sendmsg. This costs overhead.
+ *
+ * Tested with dig, python(gethostbyname), netcat, nslookup, flame.
+ *
+ * $ docker run --net=host --rm ns1labs/flame -Q 1 -c 1 -r cloudfront.net 127.0.0.53
+ * $ docker run --net=host --rm ns1labs/flame -Q 1 -c 1 -r cloudfront.net 8.8.8.8
+ * $ docker run --rm ns1labs/flame -Q 1 -c 1 -r cloudfront.net 8.8.8.8
+ */
+kprobe:udp_sendmsg
+{
+  // Method A to get port number
+  $msg = (struct msghdr *) arg1;
+  $addr = (struct sockaddr_in *) $msg->msg_name;
+  $port1 = $addr->sin_port;
+  $port1 = ($port1 >> 8) | (($port1 << 8) & 0x00ff00);  // ntohs
+
+  // Method B to get port number
+  $sk = (struct sock *) arg0;
+  $port2 = $sk->__sk_common.skc_dport;
+  $port2 = ($port2 >> 8) | (($port2 << 8) & 0x00ff00);  // ntohs
+
+  // This is necessary for addr->sin_port to return the right number in the python test case.
+  // I wonder why?
+  $wtf = (struct inet_sock *) arg0;
+
+  //debug: printf("send to port: %-5d %-5d\n", $port1, $port2);
+  if ($port1 == 53) {
+    @rate[$port1] = count();
+  } else if ($port2 == 53) {
+    @rate[$port2] = count();
+  }
+}
+
+/*
+ * Count and clear every interval. This granularity can be adjusted down to ms.
+ */
+interval:s:1
+{
+  time("%H:%M:%S | ");
+  print(@rate);
+  clear(@rate);
+}
+
+END
+{
+  clear(@rate);
+}
+
